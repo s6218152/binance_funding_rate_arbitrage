@@ -1,0 +1,16 @@
+# 忽略環境變數檔案 (包含敏感的 API 金鑰)
+.env
+
+# 忽略交易日誌 (包含個人交易紀錄)
+trade_log.csv
+
+# Python 相關的忽略項目
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 虛擬環境資料夾
+venv/
+env/
+.venv/
