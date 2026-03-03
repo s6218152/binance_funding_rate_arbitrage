@@ -1,7 +1,7 @@
 import os
 
 # 策略配置
-THRESHOLD_APY = 5.0
+THRESHOLD_APY = 8.0
 MIN_VOLUME_USDT = 50_000_000 # 最小 24h 交易量，用於篩選市場機會
 
 SNIPER_MODE = True

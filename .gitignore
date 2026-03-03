@@ -9,6 +9,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.log
 
 # 虛擬環境資料夾
 venv/

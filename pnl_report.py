@@ -4,6 +4,14 @@ import config
 import urllib.request
 import urllib.parse
 
+def _escape_markdown_v2(text: str) -> str:
+    """Escapes text for Telegram's MarkdownV2 parse mode."""
+    # In MarkdownV2, these characters must be escaped:
+    # _ * [ ] ( ) ~ ` > # + - = | { } . !
+    escape_chars = r'_*~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', str(text))
+
+
 def calculate_pnl(trades_df):
     """
     Calculates PnL for a given trading pair, specifically for hedged (spot long + futures short) positions.
@@ -18,6 +26,30 @@ def calculate_pnl(trades_df):
     # Temporary storage for open futures short positions to match with closing buys
     open_futures_short_positions = [] # list of {'quantity': float, 'price': float, 'fee': float}
 
+    def _process_spot_sell(row, open_positions):
+        """Helper function to process spot sell/close events."""
+        nonlocal realized_pnl
+        amount_to_sell = row['Quantity']
+        sell_price = row['Price']
+        sell_fee = row['Fee']
+        pnl_from_this_trade = 0
+
+        while amount_to_sell > 0 and open_positions:
+            oldest_pos = open_positions[0]
+            amount_from_oldest = min(amount_to_sell, oldest_pos['quantity'])
+
+            pnl_from_this_trade += (sell_price - oldest_pos['price']) * amount_from_oldest
+            pnl_from_this_trade -= (oldest_pos['fee'] * (amount_from_oldest / oldest_pos['quantity']) if oldest_pos['quantity'] > 0 else 0)
+            pnl_from_this_trade -= (sell_fee * (amount_from_oldest / row['Quantity']) if row['Quantity'] > 0 else 0)
+
+            oldest_pos['quantity'] -= amount_from_oldest
+            amount_to_sell -= amount_from_oldest
+
+            if oldest_pos['quantity'] < 1e-9: # Use a small epsilon for float comparison
+                open_positions.pop(0)
+        
+        return pnl_from_this_trade, amount_to_sell
+
     # Sort by timestamp to ensure FIFO logic is correctly applied
     trades_df = trades_df.sort_values(by='Timestamp').reset_index(drop=True)
 
@@ -29,25 +61,8 @@ def calculate_pnl(trades_df):
                 'fee': row['Fee']
             })
         elif row['EventType'] == 'Close_Spot':
-            amount_to_sell = row['Quantity']
-            sell_price = row['Price']
-            sell_fee = row['Fee']
-
-            while amount_to_sell > 0 and open_spot_positions:
-                oldest_spot_pos = open_spot_positions[0]
-                amount_from_oldest = min(amount_to_sell, oldest_spot_pos['quantity'])
-
-                # PnL from spot trade
-                realized_pnl += (sell_price - oldest_spot_pos['price']) * amount_from_oldest
-                realized_pnl -= (oldest_spot_pos['fee'] * (amount_from_oldest / oldest_spot_pos['quantity']) if oldest_spot_pos['quantity'] > 0 else 0)
-                realized_pnl -= (sell_fee * (amount_from_oldest / row['Quantity']) if row['Quantity'] > 0 else 0)
-
-                oldest_spot_pos['quantity'] -= amount_from_oldest
-                amount_to_sell -= amount_from_oldest
-
-                if oldest_spot_pos['quantity'] == 0:
-                    open_spot_positions.pop(0)
-
+            pnl_change, amount_to_sell = _process_spot_sell(row, open_spot_positions)
+            realized_pnl += pnl_change
             if amount_to_sell > 0:
                 print(f"Warning: Attempted to sell more spot than open buy positions for {row['Symbol']}. Remaining to sell: {amount_to_sell}")
 
@@ -74,7 +89,7 @@ def calculate_pnl(trades_df):
                 oldest_fut_short_pos['quantity'] -= amount_from_oldest
                 amount_to_buy -= amount_from_oldest
 
-                if oldest_fut_short_pos['quantity'] == 0:
+                if oldest_fut_short_pos['quantity'] < 1e-9:
                     open_futures_short_positions.pop(0)
             
             if amount_to_buy > 0:
@@ -94,25 +109,8 @@ def calculate_pnl(trades_df):
         
         # Rollback_Spot is essentially a Close_Spot for the purposes of PnL calculation
         elif row['EventType'] == 'Rollback_Spot':
-            amount_to_sell = row['Quantity']
-            sell_price = row['Price']
-            sell_fee = row['Fee']
-
-            while amount_to_sell > 0 and open_spot_positions:
-                oldest_spot_pos = open_spot_positions[0]
-                amount_from_oldest = min(amount_to_sell, oldest_spot_pos['quantity'])
-
-                # PnL from spot trade
-                realized_pnl += (sell_price - oldest_spot_pos['price']) * amount_from_oldest
-                realized_pnl -= (oldest_spot_pos['fee'] * (amount_from_oldest / oldest_spot_pos['quantity']) if oldest_spot_pos['quantity'] > 0 else 0)
-                realized_pnl -= (sell_fee * (amount_from_oldest / row['Quantity']) if row['Quantity'] > 0 else 0)
-
-                oldest_spot_pos['quantity'] -= amount_from_oldest
-                amount_to_sell -= amount_from_oldest
-
-                if oldest_spot_pos['quantity'] == 0:
-                    open_spot_positions.pop(0)
-
+            pnl_change, amount_to_sell = _process_spot_sell(row, open_spot_positions)
+            realized_pnl += pnl_change
             if amount_to_sell > 0:
                 print(f"Warning: Attempted to sell more spot than open buy positions during rollback for {row['Symbol']}. Remaining to sell: {amount_to_sell}")
 
@@ -133,7 +131,7 @@ def send_telegram_report(message):
     print(f"📤 正在發送報表至 Telegram...")
     try:
         url = f"https://api.telegram.org/bot{telegram_bot_token}/sendMessage"
-        data = urllib.parse.urlencode({"chat_id": telegram_user_id, "text": message}).encode('utf-8')
+        data = urllib.parse.urlencode({"chat_id": telegram_user_id, "text": message, "parse_mode": "MarkdownV2"}).encode('utf-8')
         req = urllib.request.Request(url, data=data)
         with urllib.request.urlopen(req) as response:
             print(f"✅ Telegram 通知發送成功！")
@@ -176,36 +174,28 @@ def main():
         report_lines.append(text)
 
     # Generate Report
-    p("--- 🦅 資金費率 PnL 報表 ---")
+    p(f"*{_escape_markdown_v2('--- 🦅 資金費率 PnL 報表 ---')}*")
     p("")
 
     if not pnl_by_pair:
-        p("No trading pairs found to analyze.")
+        p(f"_{_escape_markdown_v2('未找到可分析的交易對。')}_")
     else:
         for symbol, pnl_data in pnl_by_pair.items():
-            p(f"Pair: {symbol}")
-            p(f"  Realized PnL: {pnl_data['realized_pnl']:.2f}")
-            p(f"  Funding Fees: {pnl_data['funding_fees']:.2f}")
-            p(f"  Net PnL: {pnl_data['net_pnl']:.2f}")
-            p("-" * 20)
+            p(f"🪙 *{_escape_markdown_v2('交易對')}*: `{symbol}`")
+            p(f"  📈 {_escape_markdown_v2('已實現損益')}: `{pnl_data['realized_pnl']:.4f}`")
+            p(f"  💰 {_escape_markdown_v2('資金費用')}: `{pnl_data['funding_fees']:.4f}`")
+            net_pnl = pnl_data['net_pnl']
+            p(f"  {_escape_markdown_v2('淨損益')}: *`{net_pnl:.4f}`*")
+            p(_escape_markdown_v2("-" * 20))
         
         p("")
-        p(f"Total Realized PnL: {total_realized_pnl:.2f}")
-        p(f"Total Funding Fees: {total_funding_fees:.2f}")
-        p(f"Overall Net PnL: {total_realized_pnl + total_funding_fees:.2f}")
+        p(f"📊 *{_escape_markdown_v2('總結')}*")
+        p(f"  {_escape_markdown_v2('總已實現損益')}: `{total_realized_pnl:.4f}`")
+        p(f"  {_escape_markdown_v2('總資金費用')}: `{total_funding_fees:.4f}`")
+        overall_net_pnl = total_realized_pnl + total_funding_fees
+        p(f"  *{_escape_markdown_v2('總淨損益')}*: *`{overall_net_pnl:+.4f}`*")
 
     send_telegram_report("\n".join(report_lines))
-
-    print("\n")
-    print("--- How to Run This Script ---")
-    print('''1. Save this content as `pnl_report.py`.
-2. Ensure you have a `config.py` file in the same directory, defining `TRADE_LOG_FILE` (e.g., `TRADE_LOG_FILE = "trade_log.csv"`).
-3. Ensure your trade data is in a CSV file named `trade_log.csv` (or whatever `TRADE_LOG_FILE` is set to).
-   The CSV should have columns: `Timestamp`, `EventType`, `Symbol`, `Side`, `USDTValue`, `Quantity`, `Price`, `Fee`, `FundingFee`, `Message`.
-4. Install pandas: `pip install pandas`
-5. Run the script from your terminal: `python3 pnl_report.py` (or `python pnl_report.py` if `python` is aliased to `python3`)
-The report will be printed to your console.''')
-
 
 if __name__ == "__main__":
     main()

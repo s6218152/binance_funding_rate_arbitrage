@@ -6,6 +6,7 @@ import urllib.request
 import urllib.parse
 import json
 import math
+import re
 from datetime import datetime
 import csv
 import config # Import config to use global settings for logging and min amounts
@@ -13,6 +14,13 @@ import config # Import config to use global settings for logging and min amounts
 # ==================================================================
 # 輔助函數：日誌記錄與通知
 # ==================================================================
+
+def _escape_markdown_v2(text: str) -> str:
+    """Escapes text for Telegram's MarkdownV2 parse mode."""
+    # In MarkdownV2, these characters must be escaped:
+    # _ * [ ] ( ) ~ ` > # + - = | { } . !
+    escape_chars = r'_*~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', str(text))
 
 def log_trade_event(event_type, symbol, side="", usdt_value=0.0, quantity=0.0, price=0.0, fee=0.0, funding_fee=0.0, message=""):
     log_file = config.TRADE_LOG_FILE # Use config for log file path
@@ -27,31 +35,37 @@ def log_trade_event(event_type, symbol, side="", usdt_value=0.0, quantity=0.0, p
             event_type, symbol, side, usdt_value, quantity, price, fee, funding_fee, message
         ])
 
-def send_error_notification(message):
-    full_message = f"🚨 [資金費率機器人緊急通知] {message}"
-    print(full_message) # 仍然保留 print 到控制台
+def _send_telegram_impl(message, parse_mode=None):
     telegram_user_id = config.TELEGRAM_USER_ID
     telegram_bot_token = config.TELEGRAM_BOT_TOKEN
     
-    # 檢查 default_api 是否在當前執行環境中定義 (for cloud environments)
     if 'default_api' in globals() and telegram_user_id:
         try:
-            default_api.message(action="send", to=telegram_user_id, message=full_message)
-            print(f"✅ Telegram 通知已發送至 {telegram_user_id}")
+            default_api.message(action="send", to=telegram_user_id, message=message)
         except Exception as e:
             print(f"❌ 無法發送 Telegram 通知 (default_api 調用失敗): {e}")
-    # 檢查標準 Bot Token 是否已配置
     elif telegram_bot_token and telegram_user_id:
         try:
             url = f"https://api.telegram.org/bot{telegram_bot_token}/sendMessage"
-            data = urllib.parse.urlencode({"chat_id": telegram_user_id, "text": full_message}).encode('utf-8')
+            payload = {"chat_id": telegram_user_id, "text": message}
+            if parse_mode:
+                payload['parse_mode'] = parse_mode
+            data = urllib.parse.urlencode(payload).encode('utf-8')
             req = urllib.request.Request(url, data=data) # POST request
             with urllib.request.urlopen(req) as response:
-                print(f"✅ Telegram 通知已發送至 {telegram_user_id}")
+                pass
         except Exception as e:
             print(f"❌ 無法發送 Telegram 通知 (HTTP 請求失敗): {e}")
     else:
         print("⚠️ Telegram 通知未配置 (TELEGRAM_USER_ID 或 TELEGRAM_BOT_TOKEN 未在 .env 中設定)，無法發送通知。")
+
+def send_telegram_message(message, parse_mode=None):
+    _send_telegram_impl(message, parse_mode)
+
+def send_error_notification(message):
+    full_message = f"🚨 [資金費率機器人緊急通知] {message}"
+    print(full_message) # 仍然保留 print 到控制台
+    _send_telegram_impl(full_message)
 
 # ==================================================================
 # 核心交易與 API 交互函數
@@ -78,7 +92,7 @@ def get_keys():
         return None, None
     return api_key, secret_key
 
-def fetch_public(url, retries=3, delay=0.5):
+def fetch_public(url, retries=3, delay=0.5, silent=False):
     for i in range(retries):
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -86,18 +100,18 @@ def fetch_public(url, retries=3, delay=0.5):
                 return json.loads(response.read().decode())
         except urllib.error.HTTPError as e:
             error_body = e.read().decode()
-            if i == retries - 1:
+            if i == retries - 1 and not silent:
                 send_error_notification(f"公共 API 請求失敗 (HTTP {e.code}): {error_body}")
                 return None
             time.sleep(delay)
         except Exception as e:
-            if i == retries - 1:
+            if i == retries - 1 and not silent:
                 send_error_notification(f"公共 API 請求失敗 (未知錯誤): {str(e)}")
                 return None
             time.sleep(delay)
     return None
 
-def signed_request(endpoint, params, api_key, secret_key, method="POST", base_url="https://fapi.binance.com", retries=3, delay=0.5):
+def signed_request(endpoint, params, api_key, secret_key, method="POST", base_url="https://fapi.binance.com", retries=3, delay=0.5, silent=False):
     params['timestamp'] = int(time.time() * 1000)
     query = urllib.parse.urlencode(params)
     signature = hmac.new(secret_key.encode('utf-8'), query.encode('utf-8'), hashlib.sha256).hexdigest()
@@ -112,23 +126,23 @@ def signed_request(endpoint, params, api_key, secret_key, method="POST", base_ur
             err_msg = e.read().decode()
             # 嚴重複雜錯誤直接返回不重試，並通知
             if "-2010" in err_msg or "-2015" in err_msg: 
-                send_error_notification(f"簽名 API 請求嚴重錯誤 ({endpoint}): {err_msg}")
+                if not silent: send_error_notification(f"簽名 API 請求嚴重錯誤 ({endpoint}): {err_msg}")
                 return {"error": True, "msg": err_msg}
-            if i == retries - 1: 
-                send_error_notification(f"簽名 API 請求失敗 ({endpoint}): {err_msg}")
+            if i == retries - 1:
+                if not silent: send_error_notification(f"簽名 API 請求失敗 ({endpoint}): {err_msg}")
                 return {"error": True, "msg": err_msg}
             time.sleep(delay)
         except Exception as e:
-            if i == retries - 1: 
-                send_error_notification(f"簽名 API 請求失敗 (未知錯誤, {endpoint}): {str(e)}")
+            if i == retries - 1:
+                if not silent: send_error_notification(f"簽名 API 請求失敗 (未知錯誤, {endpoint}): {str(e)}")
                 return {"error": True, "msg": str(e)}
             time.sleep(delay)
     return {"error": True, "msg": "Unknown error"}
 
 def get_exchange_info():
     """獲取幣安現貨和合約的交易所資訊，包含交易對的精度、最小交易量等。"""
-    spot_info = fetch_public("https://api.binance.com/api/v3/exchangeInfo")
-    fut_info = fetch_public("https://fapi.binance.com/fapi/v1/exchangeInfo")
+    spot_info = fetch_public("https://api.binance.com/api/v3/exchangeInfo", silent=True)
+    fut_info = fetch_public("https://fapi.binance.com/fapi/v1/exchangeInfo", silent=True)
     return spot_info, fut_info
 
 def check_spot_pair_exists(symbol, spot_exchange_info):
@@ -143,6 +157,47 @@ def get_precision_from_step_size(step_size_str):
     if '.' in step_size_str:
         return len(step_size_str.split('.')[1])
     return 0
+
+def calculate_spot_fee(fills, price, symbol):
+    """從成交明細計算現貨手續費 (換算為 USDT)"""
+    total_fee = 0.0
+    base_asset = symbol.replace('USDT', '')
+    if symbol == 'PAXGUSDT': base_asset = 'PAXG' # 特殊處理
+    
+    bnb_price = 0.0 
+    
+    for fill in fills:
+        comm = float(fill['commission'])
+        asset = fill['commissionAsset']
+        
+        if asset == 'USDT':
+            total_fee += comm
+        elif asset == base_asset:
+            total_fee += comm * float(fill['price'])
+        elif asset == 'BNB':
+            if bnb_price == 0.0:
+                p = fetch_public("https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT")
+                if p: bnb_price = float(p['price'])
+            if bnb_price > 0:
+                total_fee += comm * bnb_price
+    return total_fee
+
+def get_futures_fee(symbol, order_id, api_key, secret_key):
+    """查詢合約成交紀錄以獲取手續費"""
+    for i in range(5): # 最多重試 5 次
+        trades = signed_request("/fapi/v1/userTrades", {"symbol": symbol, "orderId": order_id}, api_key, secret_key, method="GET")
+        if isinstance(trades, list) and trades: # 確保 trades 是非空列表
+            total_fee = 0.0
+            for t in trades:
+                total_fee += float(t['commission'])
+            return total_fee
+        
+        if i < 4: # 最後一次不延遲
+            print(f"   ... 未找到合約手續費記錄，將在 0.5 秒後重試 ({i+1}/5)")
+            time.sleep(0.5)
+
+    print(f"   ⚠️ 警告: 多次嘗試後仍無法獲取訂單 {order_id} 的手續費，將記錄為 0。")
+    return 0.0
 
 def execute_hedge_safe(symbol, amount_usdt, api_key, secret_key, spot_info_raw, fut_info_raw, min_order_usdt=config.BINANCE_MIN_ORDER_USDT):
     spot_symbol = symbol
@@ -181,7 +236,7 @@ def execute_hedge_safe(symbol, amount_usdt, api_key, secret_key, spot_info_raw, 
             break
 
     # 獲取價格
-    price_data = fetch_public(f"https://api.binance.com/api/v3/ticker/price?symbol={spot_symbol}")
+    price_data = fetch_public(f"https://api.binance.com/api/v3/ticker/price?symbol={spot_symbol}", silent=True)
     if not price_data: 
         error_msg = f"無法獲取價格: {spot_symbol}。取消下單。"
         print(f"   ❌ {error_msg}")
@@ -222,7 +277,7 @@ def execute_hedge_safe(symbol, amount_usdt, api_key, secret_key, spot_info_raw, 
     print(f"   -> 買入現貨 {final_qty} {spot_symbol}...")
     spot_res = signed_request("/api/v3/order", 
         {"symbol": spot_symbol, "side": "BUY", "type": "MARKET", "quantity": final_qty}, 
-        api_key, secret_key, method="POST", base_url="https://api.binance.com")
+        api_key, secret_key, method="POST", base_url="https://api.binance.com", silent=True)
     
     if "orderId" not in spot_res:
         error_msg = f"現貨買入失敗: {spot_res.get('msg', spot_res)}"
@@ -234,28 +289,27 @@ def execute_hedge_safe(symbol, amount_usdt, api_key, secret_key, spot_info_raw, 
     spot_cummulative_quote_qty = float(spot_res.get('cummulativeQuoteQty', 0.0))
     # 計算真實成交均價，如果成交量為0則使用下單前價格
     actual_spot_price = spot_cummulative_quote_qty / spot_executed_qty if spot_executed_qty > 0 else price
-    # 簡化費用處理，實際費用可能需要解析 fills 字段，暫時設為0
-    spot_fee = 0.0 
+    spot_fee = calculate_spot_fee(spot_res.get('fills', []), actual_spot_price, spot_symbol)
     log_trade_event("Open_Spot", spot_symbol, side="buy", usdt_value=spot_cummulative_quote_qty, quantity=spot_executed_qty, price=actual_spot_price, fee=spot_fee, message=f"ID:{spot_res['orderId']}")
     print(f"   ✅ 現貨成交! (ID: {spot_res['orderId']})")
     
     # 2. 空合約
     print(f"   -> 做空合約...")
-    set_leverage_res = signed_request("/fapi/v1/leverage", {"symbol": symbol, "leverage": 1}, api_key, secret_key, method="POST")
-    if "code" in set_leverage_res and set_leverage_res["code"] != 200: # 槓桿設定失敗也可能是問題
+    set_leverage_res = signed_request("/fapi/v1/leverage", {"symbol": symbol, "leverage": 1}, api_key, secret_key, method="POST", silent=True)
+    # 槓桿設定失敗不一定是致命錯誤，可能只是已經是 1x，所以只打印警告
+    if "code" in set_leverage_res and set_leverage_res.get("code") != 200:
         print(f"   ⚠️ 槓桿設定失敗或已是目標值: {set_leverage_res}")
 
     fut_res = signed_request("/fapi/v1/order", 
-        {"symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": final_qty, "reduceOnly": "false"}, 
-        api_key, secret_key, method="POST")
+        {"symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": spot_executed_qty, "reduceOnly": "false"}, 
+        api_key, secret_key, method="POST", silent=True)
         
-    if "orderId" in fut_res:
+    if "orderId" in fut_res and float(fut_res.get('executedQty', 0.0)) > 0:
         fut_executed_qty = float(fut_res.get('executedQty', 0.0))
         fut_cum_quote = float(fut_res.get('cumQuote', 0.0))
         # 計算真實成交均價
         actual_fut_price = fut_cum_quote / fut_executed_qty if fut_executed_qty > 0 else price
-        # 合約費用通常在佣金字段，這裡簡化為0
-        fut_fee = 0.0
+        fut_fee = get_futures_fee(symbol, fut_res['orderId'], api_key, secret_key)
         log_trade_event("Open_Futures", symbol, side="sell", usdt_value=fut_cum_quote, quantity=fut_executed_qty, price=actual_fut_price, fee=fut_fee, message=f"ID:{fut_res['orderId']}")
         print(f"   ✅ 合約空單成交! (ID: {fut_res['orderId']})")
         print(f"🎉 對沖策略部署成功！")
@@ -270,16 +324,15 @@ def execute_hedge_safe(symbol, amount_usdt, api_key, secret_key, spot_info_raw, 
         print(f"🔄 正在賣出剛剛買入的現貨 ({final_qty} {spot_symbol})...")
         
         rollback_res = signed_request("/api/v3/order", 
-            {"symbol": spot_symbol, "side": "SELL", "type": "MARKET", "quantity": final_qty}, 
-            api_key, secret_key, method="POST", base_url="https://api.binance.com")
+            {"symbol": spot_symbol, "side": "SELL", "type": "MARKET", "quantity": spot_executed_qty}, 
+            api_key, secret_key, method="POST", base_url="https://api.binance.com", silent=True)
         
         if "orderId" in rollback_res:
             rollback_executed_qty = float(rollback_res.get('executedQty', 0.0))
             rollback_cummulative_quote_qty = float(rollback_res.get('cummulativeQuoteQty', 0.0))
             # 計算真實成交均價
             actual_rollback_price = rollback_cummulative_quote_qty / rollback_executed_qty if rollback_executed_qty > 0 else price
-            # 回滾的費用通常也需要解析 fills 字段，暫時設為0
-            rollback_fee = 0.0
+            rollback_fee = calculate_spot_fee(rollback_res.get('fills', []), actual_rollback_price, spot_symbol)
             log_trade_event("Rollback_Spot", spot_symbol, side="sell", usdt_value=rollback_cummulative_quote_qty, quantity=rollback_executed_qty, price=actual_rollback_price, fee=rollback_fee, message=f"ID:{rollback_res['orderId']}")
             print(f"   ✅ 回滾成功！現貨已賣出，資金已安全撤回。")
             send_error_notification(f"交易失敗，但回滾成功。資金已安全撤回。")
@@ -316,7 +369,7 @@ def transfer_funds(amount, transfer_type, api_key, secret_key, min_transfer_amou
         "asset": "USDT",
         "amount": round(amount, 2), # 劃轉金額通常只需要兩位小數
         "type": transfer_type
-    }, api_key, secret_key, method="POST", base_url="https://api.binance.com") # 注意: /sapi/v1 是在 api.binance.com
+    }, api_key, secret_key, method="POST", base_url="https://api.binance.com", silent=True) # 注意: /sapi/v1 是在 api.binance.com
 
     if "tranId" in transfer_res:
         print(f"   ✅ 劃轉成功! Transaction ID: {transfer_res['tranId']}")
@@ -406,12 +459,26 @@ def get_all_futures_positions(api_key, secret_key):
     return active_positions
 
 def close_position(symbol, amount, api_key, secret_key, spot_info_raw): # Added spot_info_raw parameter
-    print(f"🚨 正在執行自動平倉: {symbol}...")
+    print(f"🚨 正在執行自動平倉: {symbol} (數量: {amount})...")
     fut_close_res = signed_request("/fapi/v1/order", 
         {"symbol": symbol, "side": "BUY", "type": "MARKET", "quantity": amount, "reduceOnly": "true"}, 
-        api_key, secret_key, method="POST")
+        api_key, secret_key, method="POST", silent=True)
     
-    if "orderId" not in fut_close_res:
+    # 處理市價單可能處於 NEW 狀態的情況 (尚未完全成交)
+    if "orderId" in fut_close_res and float(fut_close_res.get('executedQty', 0.0)) == 0:
+        print(f"   ⏳ 合約平倉訂單已提交 (ID: {fut_close_res['orderId']}) 但尚未成交，正在等待成交確認...")
+        for _ in range(5): # 最多等待 5 秒
+            time.sleep(1)
+            check_res = signed_request("/fapi/v1/order", 
+                {"symbol": symbol, "orderId": fut_close_res['orderId']}, 
+                api_key, secret_key, method="GET", silent=True)
+            if "status" in check_res:
+                fut_close_res = check_res # 更新訂單資訊
+                if float(fut_close_res.get('executedQty', 0.0)) > 0:
+                    print(f"   ✅ 訂單已成交！")
+                    break
+
+    if "orderId" not in fut_close_res or float(fut_close_res.get('executedQty', 0.0)) == 0:
         error_msg = f"合約平倉失敗: {fut_close_res.get('msg', fut_close_res)}"
         print(f"   ❌ {error_msg}")
         send_error_notification(f"平倉失敗: {error_msg}")
@@ -420,14 +487,15 @@ def close_position(symbol, amount, api_key, secret_key, spot_info_raw): # Added 
     fut_cum_quote = float(fut_close_res.get('cumQuote', 0.0))
     # 計算真實成交均價
     actual_fut_price = fut_cum_quote / fut_executed_qty if fut_executed_qty > 0 else 0.0
-    fut_fee = 0.0
+    fut_fee = get_futures_fee(symbol, fut_close_res['orderId'], api_key, secret_key)
     log_trade_event("Close_Futures", symbol, side="buy", usdt_value=fut_cum_quote, quantity=fut_executed_qty, price=actual_fut_price, fee=fut_fee, message=f"ID:{fut_close_res['orderId']}")
+    print(f"   ✅ 合約已平倉 {fut_executed_qty}。")
 
     spot_symbol = symbol
     if symbol == 'XAUUSDT': spot_symbol = 'PAXGUSDT'
     
     # 在賣出現貨前獲取即時價格
-    price_data = fetch_public(f"https://api.binance.com/api/v3/ticker/price?symbol={spot_symbol}")
+    price_data = fetch_public(f"https://api.binance.com/api/v3/ticker/price?symbol={spot_symbol}", silent=True)
     if not price_data:
         error_msg = f"平倉後無法獲取現貨價格 {spot_symbol}，無法賣出。"
         print(f"   ❌ {error_msg}")
@@ -435,15 +503,10 @@ def close_position(symbol, amount, api_key, secret_key, spot_info_raw): # Added 
         return
     price = float(price_data['price'])
 
-    acct = signed_request("/api/v3/account", {}, api_key, secret_key, method="GET", base_url="https://api.binance.com")
-    spot_qty = 0
-    base_asset = spot_symbol.replace('USDT', '')
-    if "balances" in acct and not "error" in acct:
-        for b in acct['balances']:
-            if b['asset'] == base_asset: spot_qty = float(b['free'])
+    # 使用合約實際平倉數量作為現貨賣出目標，而不是查詢帳戶總餘額
+    spot_qty_to_sell = fut_executed_qty
     
-    if spot_qty > 0.0001: # 留下少量 dust 防止錯誤
-        # Reuse spot_info_raw from parameter instead of fetching again
+    if spot_qty_to_sell > 0:
         s_info = next((s for s in spot_info_raw['symbols'] if s['symbol'] == spot_symbol), None)
         if s_info:
             spot_qty_prec = 0
@@ -457,19 +520,19 @@ def close_position(symbol, amount, api_key, secret_key, spot_info_raw): # Added 
                     break
             
             # 調整現貨數量以符合精度和最小下單量
-            safe_qty = math.floor(spot_qty / spot_step_size) * spot_step_size
+            safe_qty = math.floor(spot_qty_to_sell / spot_step_size) * spot_step_size
             safe_qty = round(safe_qty, spot_qty_prec)
             
             if safe_qty >= spot_min_qty: # 確保調整後的數量符合最小下單量
                 spot_sell_res = signed_request("/api/v3/order", 
                     {"symbol": spot_symbol, "side": "SELL", "type": "MARKET", "quantity": safe_qty}, 
-                    api_key, secret_key, method="POST", base_url="https://api.binance.com")
+                    api_key, secret_key, method="POST", base_url="https://api.binance.com", silent=True)
                 if "orderId" in spot_sell_res:
                     spot_executed_qty_sell = float(spot_sell_res.get('executedQty', 0.0))
                     spot_cummulative_quote_qty_sell = float(spot_sell_res.get('cummulativeQuoteQty', 0.0))
                     # 計算真實成交均價
                     actual_spot_price_sell = spot_cummulative_quote_qty_sell / spot_executed_qty_sell if spot_executed_qty_sell > 0 else price
-                    spot_fee_sell = 0.0
+                    spot_fee_sell = calculate_spot_fee(spot_sell_res.get('fills', []), actual_spot_price_sell, spot_symbol)
                     log_trade_event("Close_Spot", spot_symbol, side="sell", usdt_value=spot_cummulative_quote_qty_sell, quantity=spot_executed_qty_sell, price=actual_spot_price_sell, fee=spot_fee_sell, message=f"ID:{spot_sell_res['orderId']}")
                     print("   ✅ 現貨已賣出。")
                 else:
@@ -477,11 +540,11 @@ def close_position(symbol, amount, api_key, secret_key, spot_info_raw): # Added 
                     print(f"   ❌ {error_msg}")
                     send_error_notification(f"平倉後現貨賣出失敗: {error_msg}")
             else:
-                print(f"   ⚠️ 現貨剩餘數量 {spot_qty:.4f} 太少 ({safe_qty:.4f} < {spot_min_qty:.4f})，不滿足最小下單量，跳過賣出。")
+                print(f"   ⚠️ 應賣出現貨數量 {spot_qty_to_sell:.4f} 調整後 ({safe_qty:.4f}) 不滿足最小下單量 ({spot_min_qty:.4f})，跳過賣出。")
         else:
             print(f"   ❌ 無法獲取現貨 {spot_symbol} 交易對信息，無法賣出。")
     else:
-        print("   ✅ 現貨無剩餘。")
+        print("   ℹ️ 合約平倉數量為 0，無需賣出現貨。")
     print("🏁 自動平倉程序結束。")
 
 def scan_top_opportunities(spot_exchange_info):
