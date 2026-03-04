@@ -332,8 +332,8 @@ def main():
                         important_event_occurred = True
                 else: 
                     p("\n   💤 未觸發狙擊條件。")
-            else:
-                p("狙擊模式已關閉。\n")
+        else:
+            p("狙擊模式已關閉。\n")
     else:
         p("目前市場沒有符合條件的標的。\n")
 
