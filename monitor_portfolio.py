@@ -39,6 +39,7 @@ def main():
     spot_info, fut_info = get_exchange_info()
     if not spot_info or not fut_info:
         send_error_notification("無法取得交易所資訊，請檢查網路或幣安API狀態！")
+        os.remove(lock_file_path)
         return
     
     # Console printing function for detailed logs
@@ -57,17 +58,31 @@ def main():
     # 1. 持倉監控
     active_positions = get_all_futures_positions(api_key, secret_key)
     portfolio_max_apy = 0.0
+    portfolio_min_apy = float('inf') # 新增：用於追蹤組合中的最低 APY
     active_symbols = []
+    total_futures_notional = 0.0 # 用於計算總持倉價值
+    positions_closed_in_loop = False # 標記是否在迴圈中執行了平倉
+
+    # [優化] 批量獲取所有幣種的資金費率資料，避免迴圈中多次 API 請求
+    all_premium_indices = fetch_public("https://fapi.binance.com/fapi/v1/premiumIndex")
+    premium_index_map = {item['symbol']: item for item in all_premium_indices} if all_premium_indices else {}
 
     if active_positions:
         p("🟢 現有對沖倉位績效:")
         for pos in active_positions:
             symbol = pos['symbol']
             active_symbols.append(symbol)
-            premium_index = fetch_public(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol}")
-            if isinstance(premium_index, list): premium_index = premium_index[0]
+            # [優化] 從 Map 中直接獲取，不發送網路請求
+            premium_index = premium_index_map.get(symbol)
+            
+            # 累加持倉名目價值 (用於計算資金使用率)
+            mark_price = float(premium_index['markPrice']) if premium_index and 'markPrice' in premium_index else 0.0
+            total_futures_notional += pos['amount'] * mark_price
+            
             curr_apy = float(premium_index['lastFundingRate']) * 3 * 365 * 100 if premium_index else 0
             if curr_apy > portfolio_max_apy: portfolio_max_apy = curr_apy
+            if curr_apy < portfolio_min_apy: portfolio_min_apy = curr_apy
+            pos['apy'] = curr_apy # 記錄 APY 供後續智能換倉使用
             
             # 更新資金費入帳的日誌記錄
             incomes = signed_request("/fapi/v1/income", {"symbol": symbol, "incomeType": "FUNDING_FEE", "limit": 1}, api_key, secret_key, method="GET")
@@ -92,6 +107,7 @@ def main():
                 # 更新 close_position 調用，傳遞 spot_info
                 close_position(symbol, pos['amount'], api_key, secret_key, spot_info)
                 important_event_occurred = True
+                positions_closed_in_loop = True
                 continue
             elif curr_apy < config.THRESHOLD_APY: status = "⚠️ 警告: 收益過低"
             
@@ -101,10 +117,38 @@ def main():
         p("🟢 (目前無任何對沖倉位)\n")
         # 優化點 3.3: 調整 portfolio_max_apy 初始化與 diff_str 顯示
         portfolio_max_apy = float('-inf') # 如果沒有持倉，則視為所有機會都高於當前收益
+        portfolio_min_apy = float('inf')
+
+    # --- 狀態刷新機制 ---
+    # 如果在監控過程中發生了平倉 (例如負費率)，需要刷新狀態以避免後續邏輯使用過期數據
+    if positions_closed_in_loop:
+        p("   🔄 偵測到倉位變動 (負費率平倉)，重新獲取持倉與資金狀態...")
+        active_positions = get_all_futures_positions(api_key, secret_key)
+        # 重置狀態變數
+        active_symbols = []
+        total_futures_notional = 0.0
+        portfolio_max_apy = 0.0 if active_positions else float('-inf')
+        portfolio_min_apy = float('inf') if not active_positions else portfolio_min_apy # 保持之前的 min_apy，或在清空後重置
+        
+        if active_positions:
+            # 如果發生狀態刷新，重新獲取一次最新的批量資料
+            all_premium_indices = fetch_public("https://fapi.binance.com/fapi/v1/premiumIndex")
+            premium_index_map = {item['symbol']: item for item in all_premium_indices} if all_premium_indices else {}
+            
+            for pos in active_positions:
+                symbol = pos['symbol']
+                active_symbols.append(symbol)
+                # 快速重新計算名目價值和 Max APY
+                premium_index = premium_index_map.get(symbol)
+                mark_price = float(premium_index['markPrice']) if premium_index and 'markPrice' in premium_index else 0.0
+                total_futures_notional += pos['amount'] * mark_price
+                curr_apy = float(premium_index['lastFundingRate']) * 3 * 365 * 100 if premium_index else 0
+                if curr_apy > portfolio_max_apy: portfolio_max_apy = curr_apy
+                if curr_apy < portfolio_min_apy: portfolio_min_apy = curr_apy
 
     # 2. 掃描與狙擊
     p(f"🔍 市場前 5 名優質標的 (24h成交量 > ${config.MIN_VOLUME_USDT/1_000_000:.0f}M)...\n")
-    better_ops = scan_top_opportunities(spot_info)
+    better_ops = scan_top_opportunities(spot_info, all_premium_indices) # [優化] 傳入已獲取的資料
     
     if better_ops:
         for op in better_ops:
@@ -112,8 +156,11 @@ def main():
             diff_str = f" (🔥 高出 {diff:.1f}%)" if diff > 0 else (f" (低於當前 {abs(diff):.1f}%)" if portfolio_max_apy != float('-inf') else " (無持倉對比)") # 優化點 3.3
             p(f"{op['symbol']:<12} {op['apy']:.2f}%      ${op['vol']/1_000_000:.0f}M {diff_str}")
         
+        # 提前獲取資金狀態，確保變數在 Sniper Mode 關閉時也能用於報表，且使用最新數據
+        current_spot_free_initial, current_fut_free_initial = get_balances(api_key, secret_key)
+        
         # 狙擊邏輯
-        if config.SNIPER_MODE:
+        if config.SNIPER_MODE and better_ops:
             # 優化: 先過濾掉已持有的倉位，只關注"可下單"的機會
             # 這樣即使持有市場第一名，也不會因此錯過市場第二名的機會
             available_ops = [op for op in better_ops if op['symbol'] not in active_symbols]
@@ -121,17 +168,41 @@ def main():
             top1 = available_ops[0] if available_ops else None
             top2 = available_ops[1] if len(available_ops) > 1 else None
 
-            # 優化點 3.2: 將 get_balances 移入 check_and_balance_funds 內部，並使用其返回的最新餘額
-            # 重新獲取當前資金，因為資金平衡操作會改變餘額
-            # spot_free, fut_free = get_balances(api_key, secret_key) # 此行已被 check_and_balance_funds 內部處理
-            current_spot_free_initial, current_fut_free_initial = get_balances(api_key, secret_key) # 用於顯示初始資金
-            p(f"   (當前可用資金 Spot:${current_spot_free_initial:.1f} Fut:${current_fut_free_initial:.1f})")
+            # 估算總權益與使用率 (假設 1x 槓桿，已投入資金約為合約名目價值的 2 倍: 1份現貨 + 1份合約保證金)
+            total_invested = total_futures_notional * 2
+            total_available = current_spot_free_initial + current_fut_free_initial
+            total_equity = total_invested + total_available
+            usage_ratio = total_invested / total_equity if total_equity > 0 else 0.0
+
+            p(f"   (資金使用率: {usage_ratio*100:.1f}% | 可用資金 Spot:${current_spot_free_initial:.1f} Fut:${current_fut_free_initial:.1f})")
+
+            is_capital_maxed = False
+            if usage_ratio >= config.MAX_CAPITAL_USAGE_PERCENT:
+                p(f"   ⚠️ 資金使用率已達 {usage_ratio*100:.1f}% (>= {config.MAX_CAPITAL_USAGE_PERCENT*100:.0f}%)，將暫停新增倉位 (僅允許優質換倉)。")
+                is_capital_maxed = True
+
+            # --- 動態計算下單金額 ---
+            if config.USE_PERCENTAGE_SIZING:
+                # 一般倉位: 總權益 * 設定百分比 (例如 45%)
+                calc_single_amount = total_equity * config.POSITION_SIZE_PERCENT
+                single_shot_amount = max(calc_single_amount, config.MIN_POSITION_AMOUNT)
+                
+                # 雙重狙擊: 與單發相同
+                double_tap_amount = single_shot_amount
+                
+                # 超級機會: 總權益 * 設定百分比 (例如 90%)
+                calc_big_amount = total_equity * config.BIG_SHOT_PERCENT
+                big_shot_amount = max(calc_big_amount, config.MIN_POSITION_AMOUNT)
+            else:
+                single_shot_amount = config.SINGLE_SHOT_AMOUNT_10_20
+                double_tap_amount = config.DOUBLE_TAP_AMOUNT_EACH
+                big_shot_amount = config.BIG_SHOT_AMOUNT
 
             # --- 新增邏輯: 已有 $50 倉位，且市場出現雙重機會，則只補一個 $50 --- 
-            # 判斷是否只持有一個 $50 倉位 
-            has_one_50_position = len(active_positions) == 1 and active_positions[0]['amount'] == config.SINGLE_SHOT_AMOUNT_10_20 
+            # 判斷是否只持有一個倉位 (無論金額大小)
+            has_one_position = len(active_positions) == 1
             
-            if has_one_50_position:
+            if has_one_position and not is_capital_maxed:
                 held_symbol = active_positions[0]['symbol']
                 # 從可用機會中選出最好的那個 (排除已持有的)
                 opportunity_to_take = None
@@ -140,10 +211,10 @@ def main():
                     opportunity_to_take = top1
 
                 if opportunity_to_take:
-                    p(f"\n   🎯 已持有一倉位 ({held_symbol})，市場出現優質新機會 {opportunity_to_take['symbol']} ({opportunity_to_take['apy']:.2f}%)！準備補齊第二個倉位，單發狙擊 ${config.SINGLE_SHOT_AMOUNT_10_20:.1f}...")
-                    funds_ok, _, _ = check_and_balance_funds(api_key, secret_key, config.SINGLE_SHOT_AMOUNT_10_20, config.SINGLE_SHOT_AMOUNT_10_20, config.TRANSFER_MIN_AMOUNT)
+                    p(f"\n   🎯 已持有一倉位 ({held_symbol})，市場出現優質新機會 {opportunity_to_take['symbol']} ({opportunity_to_take['apy']:.2f}%)！準備補齊第二個倉位，單發狙擊 ${single_shot_amount:.1f}...")
+                    funds_ok, _, _ = check_and_balance_funds(api_key, secret_key, single_shot_amount, single_shot_amount, config.TRANSFER_MIN_AMOUNT)
                     if funds_ok: # 如果資金平衡成功
-                        execute_hedge_safe(opportunity_to_take['symbol'], config.SINGLE_SHOT_AMOUNT_10_20, api_key, secret_key, spot_info, fut_info, config.BINANCE_MIN_ORDER_USDT)
+                        execute_hedge_safe(opportunity_to_take['symbol'], single_shot_amount, api_key, secret_key, spot_info, fut_info, config.BINANCE_MIN_ORDER_USDT)
                         important_event_occurred = True
                     else:
                         p(f"   ❌ 狙擊 {opportunity_to_take['symbol']} 失敗: 資金不足，取消狙擊。")
@@ -156,27 +227,40 @@ def main():
                 # 計算收益差異 (僅在有持倉時計算)
                 apy_diff = 0.0
                 if top1 and active_positions:
-                    apy_diff = top1['apy'] - portfolio_max_apy
+                    apy_diff = top1['apy'] - portfolio_min_apy # 關鍵修改：與組合中表現最差的比較
 
-                # 超級機會 (>20%) 或 顯著優於當前持倉 (>10% 差異)
-                if top1 and (top1['apy'] > config.BIG_SHOT_THRESHOLD or apy_diff > 10.0):
+                # 超級機會 (>20%) 或 顯著優於當前最差持倉 (>5% 差異)
+                if top1 and (top1['apy'] > config.BIG_SHOT_THRESHOLD or apy_diff > 5.0): # 5.0 是您目前的換倉門檻
                     # 決定目標金額: 
                     # 1. 如果是真正的超級機會 (>20%)，嘗試用大倉位 (Big Shot)
                     # 2. 如果只是因為差異大而換倉 (例如 5% -> 16%)，但未達超級門檻，則保守使用普通倉位，避免小帳戶平倉後不夠錢開大倉
-                    target_amount = config.BIG_SHOT_AMOUNT
+                    target_amount = big_shot_amount
                     if top1['apy'] <= config.BIG_SHOT_THRESHOLD and apy_diff > 10.0:
-                        target_amount = config.SINGLE_SHOT_AMOUNT_10_20
+                        target_amount = single_shot_amount
 
                     reason = f"超級機會 ({top1['apy']:.2f}%)" if top1['apy'] > config.BIG_SHOT_THRESHOLD else f"收益顯著更高 (高出 {apy_diff:.1f}%)"
                     p(f"\n   🔥 發現{reason} {top1['symbol']}！")
                     
-                    # 新增邏輯: 平倉所有現有倉位
-                    if active_positions: # 只有在有活躍倉位時才平倉
-                        p(f"   🚨 偵測到{reason}！正在平倉所有現有對沖倉位，以便為新機會騰出資金...")
-                        close_all_active_positions(api_key, secret_key, spot_info) # 傳遞 spot_info
+                    # 智能平倉邏輯: 只平倉表現不佳的倉位
+                    positions_to_close = []
+                    if active_positions:
+                        for pos in active_positions:
+                            # 只平倉那些收益顯著低於新機會的倉位 (差異 > 5%)
+                            if top1['apy'] - pos.get('apy', 0) > 5.0:
+                                positions_to_close.append(pos)
+
+                    if positions_to_close:
+                        symbols_str = ", ".join([p['symbol'] for p in positions_to_close])
+                        p(f"   🚨 偵測到{reason}！正在平倉表現不佳的倉位 ({symbols_str})，以便為新機會騰出資金...")
+                        
+                        for pos in positions_to_close:
+                            close_position(pos['symbol'], pos['amount'], api_key, secret_key, spot_info)
+                        
                         # 平倉後，重新獲取最新的活躍倉位列表和可用資金
                         active_positions = get_all_futures_positions(api_key, secret_key) # Refresh active_positions after closing
                         important_event_occurred = True
+                    elif active_positions:
+                        p(f"   ℹ️ 現有倉位表現尚可 (與新機會差異 < 5%)，保留倉位不進行換倉。")
                     
                     # 執行狙擊
                     p(f"   準備狙擊 ${target_amount:.1f}...")
@@ -187,9 +271,9 @@ def main():
                         important_event_occurred = True
                     else:
                         # Fallback 機制: 如果是大倉位失敗，嘗試降級為普通倉位
-                        if target_amount == config.BIG_SHOT_AMOUNT:
-                            p(f"   ⚠️ 資金不足以進行超級狙擊 (${target_amount})，嘗試降級為普通狙擊 (${config.SINGLE_SHOT_AMOUNT_10_20})...")
-                            target_amount = config.SINGLE_SHOT_AMOUNT_10_20
+                        if target_amount == big_shot_amount:
+                            p(f"   ⚠️ 資金不足以進行超級狙擊 (${target_amount:.1f})，嘗試降級為普通狙擊 (${single_shot_amount:.1f})...")
+                            target_amount = single_shot_amount
                             funds_ok_retry, _, _ = check_and_balance_funds(api_key, secret_key, target_amount, target_amount, config.TRANSFER_MIN_AMOUNT)
                             if funds_ok_retry:
                                 execute_hedge_safe(top1['symbol'], target_amount, api_key, secret_key, spot_info, fut_info, config.BINANCE_MIN_ORDER_USDT)
@@ -203,14 +287,14 @@ def main():
 
                 
                 # 雙重機會 (兩個新的 10-20% 機會)
-                elif top1 and top2 and (config.DOUBLE_TAP_MIN <= top1['apy'] <= config.DOUBLE_TAP_MAX) and (config.DOUBLE_TAP_MIN <= top2['apy'] <= config.DOUBLE_TAP_MAX):
-                    p(f"\n   🔫 發現雙重機會 {top1['symbol']} ({top1['apy']:.2f}%) & {top2['symbol']} ({top2['apy']:.2f}%)！準備雙重狙擊各 ${config.DOUBLE_TAP_AMOUNT_EACH:.1f}...")
+                elif top1 and top2 and not is_capital_maxed and (config.DOUBLE_TAP_MIN <= top1['apy'] <= config.DOUBLE_TAP_MAX) and (config.DOUBLE_TAP_MIN <= top2['apy'] <= config.DOUBLE_TAP_MAX):
+                    p(f"\n   🔫 發現雙重機會 {top1['symbol']} ({top1['apy']:.2f}%) & {top2['symbol']} ({top2['apy']:.2f}%)！準備雙重狙擊各 ${double_tap_amount:.1f}...")
                     # 兩個 $50 總共需要 $100 現貨, $100 合約
                     # 優化點 3.2: 確保資金平衡後使用正確的餘額，避免重複獲取
-                    funds_ok_double_tap, _, _ = check_and_balance_funds(api_key, secret_key, config.DOUBLE_TAP_AMOUNT_EACH * 2, config.DOUBLE_TAP_AMOUNT_EACH * 2, config.TRANSFER_MIN_AMOUNT)
+                    funds_ok_double_tap, _, _ = check_and_balance_funds(api_key, secret_key, double_tap_amount * 2, double_tap_amount * 2, config.TRANSFER_MIN_AMOUNT)
                     if funds_ok_double_tap:
-                        execute_hedge_safe(top1['symbol'], config.DOUBLE_TAP_AMOUNT_EACH, api_key, secret_key, spot_info, fut_info, config.BINANCE_MIN_ORDER_USDT)
-                        execute_hedge_safe(top2['symbol'], config.DOUBLE_TAP_AMOUNT_EACH, api_key, secret_key, spot_info, fut_info, config.BINANCE_MIN_ORDER_USDT)
+                        execute_hedge_safe(top1['symbol'], double_tap_amount, api_key, secret_key, spot_info, fut_info, config.BINANCE_MIN_ORDER_USDT)
+                        execute_hedge_safe(top2['symbol'], double_tap_amount, api_key, secret_key, spot_info, fut_info, config.BINANCE_MIN_ORDER_USDT)
                         important_event_occurred = True
                     else:
                         p(f"   ❌ 雙重狙擊 {top1['symbol']} & {top2['symbol']} 失敗: 總資金不足以進行雙重狙擊。")
@@ -226,30 +310,30 @@ def main():
                             opportunity_to_take_single = top2
 
                         # 優化點 3.2: 確保資金平衡後使用正確的餘額，避免重複獲取
-                        funds_ok_single_tap, _, _ = check_and_balance_funds(api_key, secret_key, config.SINGLE_SHOT_AMOUNT_10_20, config.SINGLE_SHOT_AMOUNT_10_20, config.TRANSFER_MIN_AMOUNT)
+                        funds_ok_single_tap, _, _ = check_and_balance_funds(api_key, secret_key, single_shot_amount, single_shot_amount, config.TRANSFER_MIN_AMOUNT)
                         if funds_ok_single_tap:
-                            p(f"   🎯 資金足夠單獨狙擊 {opportunity_to_take_single['symbol']} (${config.SINGLE_SHOT_AMOUNT_10_20:.1f})。")
-                            execute_hedge_safe(opportunity_to_take_single['symbol'], config.SINGLE_SHOT_AMOUNT_10_20, api_key, secret_key, spot_info, fut_info, config.BINANCE_MIN_ORDER_USDT)
+                            p(f"   🎯 資金足夠單獨狙擊 {opportunity_to_take_single['symbol']} (${single_shot_amount:.1f})。")
+                            execute_hedge_safe(opportunity_to_take_single['symbol'], single_shot_amount, api_key, secret_key, spot_info, fut_info, config.BINANCE_MIN_ORDER_USDT)
                             important_event_occurred = True
                         else:
                             p(f"   ❌ 單獨狙擊 {opportunity_to_take_single['symbol']} 失敗: 資金不足以進行任何狙擊。")
                             important_event_occurred = True
                 
                 # 單獨機會 (一個新的 10-20% 機會)
-                elif top1 and (config.DOUBLE_TAP_MIN <= top1['apy'] <= config.DOUBLE_TAP_MAX):
-                    p(f"\n   🎯 發現單獨機會 {top1['symbol']} ({top1['apy']:.2f}%)！準備單發狙擊 ${config.SINGLE_SHOT_AMOUNT_10_20:.1f}...")
+                elif top1 and not is_capital_maxed and (config.DOUBLE_TAP_MIN <= top1['apy'] <= config.DOUBLE_TAP_MAX):
+                    p(f"\n   🎯 發現單獨機會 {top1['symbol']} ({top1['apy']:.2f}%)！準備單發狙擊 ${single_shot_amount:.1f}...")
                     # 優化點 3.2: 確保資金平衡後使用正確的餘額，避免重複獲取
-                    funds_ok, _, _ = check_and_balance_funds(api_key, secret_key, config.SINGLE_SHOT_AMOUNT_10_20, config.SINGLE_SHOT_AMOUNT_10_20, config.TRANSFER_MIN_AMOUNT)
+                    funds_ok, _, _ = check_and_balance_funds(api_key, secret_key, single_shot_amount, single_shot_amount, config.TRANSFER_MIN_AMOUNT)
                     if funds_ok:
-                        execute_hedge_safe(top1['symbol'], config.SINGLE_SHOT_AMOUNT_10_20, api_key, secret_key, spot_info, fut_info, config.BINANCE_MIN_ORDER_USDT)
+                        execute_hedge_safe(top1['symbol'], single_shot_amount, api_key, secret_key, spot_info, fut_info, config.BINANCE_MIN_ORDER_USDT)
                         important_event_occurred = True
                     else:
                         p(f"   ❌ 單獨狙擊 {top1['symbol']} 失敗: 資金不足，取消狙擊。")
                         important_event_occurred = True
                 else: 
                     p("\n   💤 未觸發狙擊條件。")
-        else:
-            p("狙擊模式已關閉。\n")
+            else:
+                p("狙擊模式已關閉。\n")
     else:
         p("目前市場沒有符合條件的標的。\n")
 
@@ -269,13 +353,15 @@ def main():
 
     # Re-fetch data for the report to ensure it's current after any actions
     active_positions_final = get_all_futures_positions(api_key, secret_key)
+    # [優化] 報表生成時也使用批量獲取 (為了數據新鮮度，這裡再抓一次是合理的，但一次抓全部比抓N次快)
+    report_premium_indices = fetch_public("https://fapi.binance.com/fapi/v1/premiumIndex", silent=True)
+    report_index_map = {item['symbol']: item for item in report_premium_indices} if report_premium_indices else {}
     
     telegram_report_lines.append(f"*{_escape_markdown_v2('🟢 現有對沖倉位')}*")
     if active_positions_final:
         for pos in active_positions_final:
             symbol = pos['symbol']
-            premium_index = fetch_public(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol}", silent=True)
-            if isinstance(premium_index, list): premium_index = premium_index[0]
+            premium_index = report_index_map.get(symbol)
             curr_apy = float(premium_index['lastFundingRate']) * 3 * 365 * 100 if premium_index else 0
             
             status = "✅ 正常"
@@ -307,10 +393,13 @@ def main():
         telegram_report_lines.append(f"_{_escape_markdown_v2('(目前市場沒有符合條件的標的)')}_")
         telegram_report_lines.append("")
 
+    # [修正] 在生成報表前重新獲取最新資金，確保數值準確 (因為交易過程中資金可能已變動)
+    current_spot_free_final, current_fut_free_final = get_balances(api_key, secret_key)
+
     # Use the initial balance for the report
     telegram_report_lines.append(f"*{_escape_markdown_v2('💰 可用資金')}*")
-    telegram_report_lines.append(f" `{_escape_markdown_v2(f'├ 現貨: ${current_spot_free_initial:.1f}')}`")
-    telegram_report_lines.append(f" `{_escape_markdown_v2(f'└ 合約: ${current_fut_free_initial:.1f}')}`")
+    telegram_report_lines.append(f" `{_escape_markdown_v2(f'├ 現貨: ${current_spot_free_final:.1f}')}`")
+    telegram_report_lines.append(f" `{_escape_markdown_v2(f'└ 合約: ${current_fut_free_final:.1f}')}`")
     
     # Send the formatted report to Telegram
     send_telegram_message("\n".join(telegram_report_lines), parse_mode="MarkdownV2")

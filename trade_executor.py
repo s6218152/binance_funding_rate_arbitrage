@@ -304,6 +304,20 @@ def execute_hedge_safe(symbol, amount_usdt, api_key, secret_key, spot_info_raw, 
         {"symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": spot_executed_qty, "reduceOnly": "false"}, 
         api_key, secret_key, method="POST", silent=True)
         
+    # 處理市價單可能處於 NEW 狀態的情況 (尚未完全成交)
+    if "orderId" in fut_res and float(fut_res.get('executedQty', 0.0)) == 0:
+        print(f"   ⏳ 合約做空訂單已提交 (ID: {fut_res['orderId']}) 但尚未成交，正在等待成交確認...")
+        for _ in range(5): # 最多等待 5 秒
+            time.sleep(1)
+            check_res = signed_request("/fapi/v1/order", 
+                {"symbol": symbol, "orderId": fut_res['orderId']}, 
+                api_key, secret_key, method="GET", silent=True)
+            if "status" in check_res:
+                fut_res = check_res # 更新訂單資訊
+                if float(fut_res.get('executedQty', 0.0)) > 0:
+                    print(f"   ✅ 訂單已成交！")
+                    break
+        
     if "orderId" in fut_res and float(fut_res.get('executedQty', 0.0)) > 0:
         fut_executed_qty = float(fut_res.get('executedQty', 0.0))
         fut_cum_quote = float(fut_res.get('cumQuote', 0.0))
@@ -354,6 +368,17 @@ def get_balances(api_key, secret_key):
     if "availableBalance" in fut_acct and not "error" in fut_acct: fut_free = float(fut_acct['availableBalance'])
         
     return spot_free, fut_free
+
+def get_specific_spot_balance(asset, api_key, secret_key):
+    """獲取指定現貨資產的可用餘額"""
+    # Use silent=True to prevent duplicate notifications if API fails
+    spot_acct = signed_request("/api/v3/account", {}, api_key, secret_key, method="GET", base_url="https://api.binance.com", silent=True)
+    if spot_acct and "balances" in spot_acct:
+        for b in spot_acct['balances']:
+            if b['asset'] == asset:
+                return float(b['free'])
+    # If API fails or asset not found, return 0 and let the logic handle it
+    return 0.0
 
 def transfer_funds(amount, transfer_type, api_key, secret_key, min_transfer_amount=config.TRANSFER_MIN_AMOUNT):
     # transfer_type: "MAIN_UMFUTURE" (Spot to Futures), "UMFUTURE_MAIN" (Futures to Spot)
@@ -460,6 +485,23 @@ def get_all_futures_positions(api_key, secret_key):
 
 def close_position(symbol, amount, api_key, secret_key, spot_info_raw): # Added spot_info_raw parameter
     print(f"🚨 正在執行自動平倉: {symbol} (數量: {amount})...")
+
+    # --- Pre-flight check: Verify spot leg exists before taking action ---
+    spot_symbol = symbol
+    if symbol == 'XAUUSDT': spot_symbol = 'PAXGUSDT'
+    base_asset = spot_symbol.replace('USDT', '')
+    if spot_symbol == 'PAXGUSDT': base_asset = 'PAXG' # Handle special case
+
+    spot_balance = get_specific_spot_balance(base_asset, api_key, secret_key)
+    
+    # Check if we have at least 95% of the expected spot amount.
+    # This allows for minor precision differences but catches major discrepancies like a missing spot leg.
+    if spot_balance < amount * 0.95:
+        error_msg = f"偵測到對沖不完整！預期持有 {amount:.4f} {base_asset} 現貨，但帳戶僅有 {spot_balance:.4f}。為避免風險，自動平倉已取消。請手動檢查並處理 {symbol} 倉位。"
+        print(f"   ❌ {error_msg}")
+        send_error_notification(f"平倉失敗: {error_msg}")
+        return # ABORT closing procedure
+
     fut_close_res = signed_request("/fapi/v1/order", 
         {"symbol": symbol, "side": "BUY", "type": "MARKET", "quantity": amount, "reduceOnly": "true"}, 
         api_key, secret_key, method="POST", silent=True)
@@ -503,8 +545,13 @@ def close_position(symbol, amount, api_key, secret_key, spot_info_raw): # Added 
         return
     price = float(price_data['price'])
 
-    # 使用合約實際平倉數量作為現貨賣出目標，而不是查詢帳戶總餘額
-    spot_qty_to_sell = fut_executed_qty
+    # 獲取當前現貨餘額，防止因手續費扣除導致餘額略少於合約數量而報錯
+    base_asset = spot_symbol.replace('USDT', '')
+    if spot_symbol == 'PAXGUSDT': base_asset = 'PAXG'
+    current_spot_balance = get_specific_spot_balance(base_asset, api_key, secret_key)
+
+    # 使用合約實際平倉數量與現貨餘額的較小值作為賣出目標
+    spot_qty_to_sell = min(fut_executed_qty, current_spot_balance)
     
     if spot_qty_to_sell > 0:
         s_info = next((s for s in spot_info_raw['symbols'] if s['symbol'] == spot_symbol), None)
@@ -524,9 +571,29 @@ def close_position(symbol, amount, api_key, secret_key, spot_info_raw): # Added 
             safe_qty = round(safe_qty, spot_qty_prec)
             
             if safe_qty >= spot_min_qty: # 確保調整後的數量符合最小下單量
-                spot_sell_res = signed_request("/api/v3/order", 
-                    {"symbol": spot_symbol, "side": "SELL", "type": "MARKET", "quantity": safe_qty}, 
-                    api_key, secret_key, method="POST", base_url="https://api.binance.com", silent=True)
+                spot_sell_res = {}
+                # 重試機制：嘗試 100%, 99%, 98% 的數量，以解決餘額不足或精度問題
+                for attempt in range(3):
+                    factor = 1.0 - (attempt * 0.01)
+                    qty_to_try = spot_qty_to_sell * factor
+                    
+                    # 重新計算符合精度的數量
+                    current_safe_qty = math.floor(qty_to_try / spot_step_size) * spot_step_size
+                    current_safe_qty = round(current_safe_qty, spot_qty_prec)
+                    
+                    if current_safe_qty < spot_min_qty:
+                        break
+                    
+                    if attempt > 0:
+                        print(f"   🔄 第 {attempt} 次重試賣出現貨 (嘗試數量: {current_safe_qty})...")
+
+                    spot_sell_res = signed_request("/api/v3/order", 
+                        {"symbol": spot_symbol, "side": "SELL", "type": "MARKET", "quantity": current_safe_qty}, 
+                        api_key, secret_key, method="POST", base_url="https://api.binance.com", silent=True)
+                    
+                    if "orderId" in spot_sell_res:
+                        break
+
                 if "orderId" in spot_sell_res:
                     spot_executed_qty_sell = float(spot_sell_res.get('executedQty', 0.0))
                     spot_cummulative_quote_qty_sell = float(spot_sell_res.get('cummulativeQuoteQty', 0.0))
@@ -547,8 +614,9 @@ def close_position(symbol, amount, api_key, secret_key, spot_info_raw): # Added 
         print("   ℹ️ 合約平倉數量為 0，無需賣出現貨。")
     print("🏁 自動平倉程序結束。")
 
-def scan_top_opportunities(spot_exchange_info):
-    rates = fetch_public("https://fapi.binance.com/fapi/v1/premiumIndex")
+def scan_top_opportunities(spot_exchange_info, rates=None):
+    if rates is None:
+        rates = fetch_public("https://fapi.binance.com/fapi/v1/premiumIndex")
     tickers = fetch_public("https://fapi.binance.com/fapi/v1/ticker/24hr")
     if not rates or not tickers: return []
 

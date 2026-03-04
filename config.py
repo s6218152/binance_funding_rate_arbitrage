@@ -15,9 +15,15 @@ EXCLUDE_SYMBOLS = [
 ]
 
 # 交易金額配置
-SINGLE_SHOT_AMOUNT_10_20 = 50.0 # 單獨機會 (10-20% APY) 下單金額
-DOUBLE_TAP_AMOUNT_EACH = 50.0   # 雙重機會，每個標的下單金額
-BIG_SHOT_AMOUNT = 100.0         # 超級機會 (>20% APY) 下單金額
+USE_PERCENTAGE_SIZING = True  # [推薦] 是否啟用百分比倉位管理 (True=啟用, False=使用下方固定金額)
+POSITION_SIZE_PERCENT = 0.45  # 一般倉位佔總資金的比例 (0.45 = 45%，留 10% 緩衝給雙重狙擊)
+BIG_SHOT_PERCENT = 0.90       # 超級機會佔總資金的比例 (0.90 = 90%，全倉出擊)
+MIN_POSITION_AMOUNT = 10.0    # 最小開倉金額 (低於此值不開倉，避免手續費佔比過高)
+
+SINGLE_SHOT_AMOUNT_10_20 = 50.0 # (備用) 固定金額 - 單獨機會
+DOUBLE_TAP_AMOUNT_EACH = 50.0   # (備用) 固定金額 - 雙重機會
+BIG_SHOT_AMOUNT = 100.0         # (備用) 固定金額 - 超級機會
+MAX_CAPITAL_USAGE_PERCENT = 0.88 # 資金使用率上限 (88%)，超過則停止開新倉
 
 # 其他配置
 BINANCE_MIN_ORDER_USDT = 5.5  # 幣安最小訂單金額 (通常是 5 USDT，為保險起見設 5.5)
