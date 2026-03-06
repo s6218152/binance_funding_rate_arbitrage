@@ -25,7 +25,7 @@ def main():
             os.remove(lock_file_path)
         else:
             print("🔄 另一個監控程序正在運行，本次執行跳過。")
-            sys.exit()
+            return
     
     # 創建鎖定檔案
     with open(lock_file_path, 'w') as f:

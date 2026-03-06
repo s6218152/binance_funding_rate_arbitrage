@@ -135,6 +135,9 @@ def send_telegram_report(message):
         req = urllib.request.Request(url, data=data)
         with urllib.request.urlopen(req) as response:
             print(f"✅ Telegram 通知發送成功！")
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode()
+        print(f"❌ 無法發送 Telegram 通知 (HTTP {e.code}): {error_body}")
     except Exception as e:
         print(f"❌ 無法發送 Telegram 通知: {e}")
 

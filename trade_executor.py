@@ -145,12 +145,33 @@ def get_exchange_info():
     fut_info = fetch_public("https://fapi.binance.com/fapi/v1/exchangeInfo", silent=True)
     return spot_info, fut_info
 
+def get_spot_symbol(symbol: str) -> str:
+    """將合約交易對轉換為對應的現貨交易對 (處理特殊情況如 XAUUSDT)"""
+    if symbol == 'XAUUSDT':
+        return 'PAXGUSDT'
+    return symbol
+
+def get_base_asset(spot_symbol: str) -> str:
+    """從現貨交易對中提取基礎資產 (Base Asset)"""
+    if spot_symbol == 'PAXGUSDT':
+        return 'PAXG'
+    return spot_symbol.replace('USDT', '')
+
+def get_lot_size_filter(symbol_info):
+    """從交易對過濾器資訊中解析 LOT_SIZE"""
+    if not symbol_info or 'filters' not in symbol_info:
+        return 0.0, 0.0, 0
+    for f in symbol_info['filters']:
+        if f['filterType'] == 'LOT_SIZE':
+            min_qty = float(f['minQty'])
+            step_size = float(f['stepSize'])
+            qty_prec = get_precision_from_step_size(f['stepSize'])
+            return min_qty, step_size, qty_prec
+    return 0.0, 0.0, 0
+
 def check_spot_pair_exists(symbol, spot_exchange_info):
     """檢查現貨交易對是否存在且處於交易狀態"""
-    base_asset = symbol.replace('USDT', '')
-    target_symbol = symbol
-    if base_asset == 'XAU': # 特殊處理 PAXGUSDT
-        target_symbol = 'PAXGUSDT'
+    target_symbol = get_spot_symbol(symbol)
     
     for s in spot_exchange_info['symbols']:
         if s['symbol'] == target_symbol:
@@ -166,8 +187,8 @@ def get_precision_from_step_size(step_size_str):
 def calculate_spot_fee(fills, price, symbol):
     """從成交明細計算現貨手續費 (換算為 USDT)"""
     total_fee = 0.0
-    base_asset = symbol.replace('USDT', '')
-    if symbol == 'PAXGUSDT': base_asset = 'PAXG' # 特殊處理
+    spot_symbol = get_spot_symbol(symbol)
+    base_asset = get_base_asset(spot_symbol)
     
     bnb_price = 0.0 
     
@@ -205,8 +226,7 @@ def get_futures_fee(symbol, order_id, api_key, secret_key):
     return 0.0
 
 def execute_hedge_safe(symbol, amount_usdt, api_key, secret_key, spot_info_raw, fut_info_raw, min_order_usdt=config.BINANCE_MIN_ORDER_USDT):
-    spot_symbol = symbol
-    if symbol == 'XAUUSDT': spot_symbol = 'PAXGUSDT'
+    spot_symbol = get_spot_symbol(symbol)
     
     print(f"🔫 [安全狙擊] 執行對沖: {symbol} (${amount_usdt})...")
 
@@ -220,25 +240,8 @@ def execute_hedge_safe(symbol, amount_usdt, api_key, secret_key, spot_info_raw, 
         send_error_notification(f"交易失敗: {error_msg}")
         return False
 
-    spot_qty_prec = 0
-    spot_min_qty = 0
-    spot_step_size = 0
-    for f in s_info['filters']:
-        if f['filterType'] == 'LOT_SIZE':
-            spot_min_qty = float(f['minQty'])
-            spot_step_size = float(f['stepSize'])
-            spot_qty_prec = get_precision_from_step_size(f['stepSize'])
-            break
-
-    fut_qty_prec = 0
-    fut_min_qty = 0
-    fut_step_size = 0
-    for f in f_info['filters']:
-        if f['filterType'] == 'LOT_SIZE':
-            fut_min_qty = float(f['minQty'])
-            fut_step_size = float(f['stepSize'])
-            fut_qty_prec = get_precision_from_step_size(f['stepSize'])
-            break
+    spot_min_qty, spot_step_size, spot_qty_prec = get_lot_size_filter(s_info)
+    fut_min_qty, fut_step_size, fut_qty_prec = get_lot_size_filter(f_info)
 
     # 獲取價格
     price_data = fetch_public(f"https://api.binance.com/api/v3/ticker/price?symbol={spot_symbol}", silent=True)
@@ -499,10 +502,8 @@ def close_position(symbol, amount, api_key, secret_key, spot_info_raw): # Added 
     print(f"🚨 正在執行自動平倉: {symbol} (數量: {amount})...")
 
     # --- Pre-flight check: Verify spot leg exists before taking action ---
-    spot_symbol = symbol
-    if symbol == 'XAUUSDT': spot_symbol = 'PAXGUSDT'
-    base_asset = spot_symbol.replace('USDT', '')
-    if spot_symbol == 'PAXGUSDT': base_asset = 'PAXG' # Handle special case
+    spot_symbol = get_spot_symbol(symbol)
+    base_asset = get_base_asset(spot_symbol)
 
     spot_balance = get_specific_spot_balance(base_asset, api_key, secret_key)
     
@@ -546,8 +547,7 @@ def close_position(symbol, amount, api_key, secret_key, spot_info_raw): # Added 
     print(f"   ✅ 合約已平倉 {fut_executed_qty}。")
     send_telegram_message(f"🟢 [平倉] 合約平倉成功: {symbol}\n數量: {fut_executed_qty}\n均價: {actual_fut_price:.4f}\n名目價值: {fut_cum_quote:.2f} USDT")
 
-    spot_symbol = symbol
-    if symbol == 'XAUUSDT': spot_symbol = 'PAXGUSDT'
+    spot_symbol = get_spot_symbol(symbol)
     
     # 在賣出現貨前獲取即時價格
     price_data = fetch_public(f"https://api.binance.com/api/v3/ticker/price?symbol={spot_symbol}", silent=True)
@@ -559,8 +559,7 @@ def close_position(symbol, amount, api_key, secret_key, spot_info_raw): # Added 
     price = float(price_data['price'])
 
     # 獲取當前現貨餘額，防止因手續費扣除導致餘額略少於合約數量而報錯
-    base_asset = spot_symbol.replace('USDT', '')
-    if spot_symbol == 'PAXGUSDT': base_asset = 'PAXG'
+    base_asset = get_base_asset(spot_symbol)
     current_spot_balance = get_specific_spot_balance(base_asset, api_key, secret_key)
 
     # 使用合約實際平倉數量與現貨餘額的較小值作為賣出目標
@@ -569,15 +568,7 @@ def close_position(symbol, amount, api_key, secret_key, spot_info_raw): # Added 
     if spot_qty_to_sell > 0:
         s_info = next((s for s in spot_info_raw['symbols'] if s['symbol'] == spot_symbol), None)
         if s_info:
-            spot_qty_prec = 0
-            spot_min_qty = 0
-            spot_step_size = 0
-            for f in s_info['filters']:
-                if f['filterType'] == 'LOT_SIZE':
-                    spot_min_qty = float(f['minQty'])
-                    spot_step_size = float(f['stepSize'])
-                    spot_qty_prec = get_precision_from_step_size(f['stepSize'])
-                    break
+            spot_min_qty, spot_step_size, spot_qty_prec = get_lot_size_filter(s_info)
             
             # 調整現貨數量以符合精度和最小下單量
             safe_qty = math.floor(spot_qty_to_sell / spot_step_size) * spot_step_size
@@ -635,6 +626,8 @@ def scan_top_opportunities(spot_exchange_info, rates=None):
     if not rates or not tickers: return []
 
     vol_map = {t['symbol']: float(t['quoteVolume']) for t in tickers}
+    spot_status_map = {s['symbol']: s.get('status') for s in spot_exchange_info['symbols']}
+    
     candidates = []
     for item in rates:
         s = item['symbol']
@@ -642,7 +635,9 @@ def scan_top_opportunities(spot_exchange_info, rates=None):
         if s in config.EXCLUDE_SYMBOLS: continue # 使用 config 中的 EXCLUDE_SYMBOLS
         vol = vol_map.get(s, 0)
         if vol < config.MIN_VOLUME_USDT: continue # 使用 config 中的 MIN_VOLUME_USDT
-        if not check_spot_pair_exists(s, spot_exchange_info): continue
+        
+        target_symbol = get_spot_symbol(s)
+        if spot_status_map.get(target_symbol) != 'TRADING': continue
         
         rate = float(item['lastFundingRate'])
         apy = rate * 3 * 365 * 100
