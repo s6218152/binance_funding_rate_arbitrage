@@ -152,8 +152,11 @@ def main():
     
     if better_ops:
         for op in better_ops:
-            diff = op['apy'] - portfolio_max_apy
-            diff_str = f" (🔥 高出 {diff:.1f}%)" if diff > 0 else (f" (低於當前 {abs(diff):.1f}%)" if portfolio_max_apy != float('-inf') else " (無持倉對比)") # 優化點 3.3
+            if portfolio_max_apy == float('-inf'):
+                diff_str = ""
+            else:
+                diff = op['apy'] - portfolio_max_apy
+                diff_str = f" (🔥 高出 {diff:.1f}%)" if diff > 0 else f" (低於當前 {abs(diff):.1f}%)"
             p(f"{op['symbol']:<12} {op['apy']:.2f}%      ${op['vol']/1_000_000:.0f}M {diff_str}")
         
         # 提前獲取資金狀態，確保變數在 Sniper Mode 關閉時也能用於報表，且使用最新數據
@@ -211,6 +214,14 @@ def main():
                     opportunity_to_take = top1
 
                 if opportunity_to_take:
+                    # [修正] 補齊第二倉位時，檢查剩餘資金是否足夠，若不足則自動調整金額
+                    total_avail_second = current_spot_free_initial + current_fut_free_initial
+                    max_affordable_second = total_avail_second / 2.03
+                    if single_shot_amount > max_affordable_second:
+                        if max_affordable_second >= config.BINANCE_MIN_ORDER_USDT:
+                            p(f"   ⚠️ 資金調整: 可用餘額 (${total_avail_second:.1f}) 不足目標 (${single_shot_amount:.1f})，調整第二倉位金額為 (${max_affordable_second:.1f})...")
+                            single_shot_amount = max_affordable_second
+
                     p(f"\n   🎯 已持有一倉位 ({held_symbol})，市場出現優質新機會 {opportunity_to_take['symbol']} ({opportunity_to_take['apy']:.2f}%)！準備補齊第二個倉位，單發狙擊 ${single_shot_amount:.1f}...")
                     funds_ok, _, _ = check_and_balance_funds(api_key, secret_key, single_shot_amount, single_shot_amount, config.TRANSFER_MIN_AMOUNT)
                     if funds_ok: # 如果資金平衡成功
@@ -229,8 +240,11 @@ def main():
                 if top1 and active_positions:
                     apy_diff = top1['apy'] - portfolio_min_apy # 關鍵修改：與組合中表現最差的比較
 
-                # 超級機會 (>20%) 或 顯著優於當前最差持倉 (>5% 差異)
-                if top1 and (top1['apy'] > config.BIG_SHOT_THRESHOLD or apy_diff > 5.0): # 5.0 是您目前的換倉門檻
+                # [優化] 提高換倉門檻至 10%，避免因頻繁換倉導致手續費 (約 0.3%) 吃掉利潤
+                # 0.3% 手續費 / (5% 年化差 / 365) ≈ 22 天回本。門檻過低會導致頻繁磨損。
+                swap_threshold = 10.0
+                # 超級機會 (>20%) 或 顯著優於當前最差持倉 (>10% 差異)
+                if top1 and (top1['apy'] > config.BIG_SHOT_THRESHOLD or apy_diff > swap_threshold):
                     # 決定目標金額: 
                     # 1. 如果是真正的超級機會 (>20%)，嘗試用大倉位 (Big Shot)
                     # 2. 如果只是因為差異大而換倉 (例如 5% -> 16%)，但未達超級門檻，則保守使用普通倉位，避免小帳戶平倉後不夠錢開大倉
@@ -245,8 +259,8 @@ def main():
                     positions_to_close = []
                     if active_positions:
                         for pos in active_positions:
-                            # 只平倉那些收益顯著低於新機會的倉位 (差異 > 5%)
-                            if top1['apy'] - pos.get('apy', 0) > 5.0:
+                            # 只平倉那些收益顯著低於新機會的倉位 (差異 > 10%)
+                            if top1['apy'] - pos.get('apy', 0) > swap_threshold:
                                 positions_to_close.append(pos)
 
                     if positions_to_close:
@@ -259,8 +273,20 @@ def main():
                         # 平倉後，重新獲取最新的活躍倉位列表和可用資金
                         active_positions = get_all_futures_positions(api_key, secret_key) # Refresh active_positions after closing
                         important_event_occurred = True
+                        
+                        # [修正] 平倉後重新檢查資金，並根據可用資金調整目標下單金額
+                        # 防止平倉釋放的資金少於預設的 target_amount 導致下單失敗
+                        curr_spot_check, curr_fut_check = get_balances(api_key, secret_key)
+                        total_avail_check = curr_spot_check + curr_fut_check
+                        # 計算最大可下單金額 (單邊)，預留 2% 總緩衝 (雙邊各 1%)
+                        max_affordable = total_avail_check / 2.03
+                        
+                        if target_amount > max_affordable:
+                            if max_affordable >= config.BINANCE_MIN_ORDER_USDT:
+                                p(f"   ⚠️ 資金重算: 平倉後可用餘額 (${total_avail_check:.1f}) 不足原目標 (${target_amount:.1f})，自動調整為 (${max_affordable:.1f})...")
+                                target_amount = max_affordable
                     elif active_positions:
-                        p(f"   ℹ️ 現有倉位表現尚可 (與新機會差異 < 5%)，保留倉位不進行換倉。")
+                        p(f"   ℹ️ 現有倉位表現尚可 (與新機會差異 < {swap_threshold:.1f}%)，保留倉位不進行換倉。")
                     
                     # 執行狙擊
                     p(f"   準備狙擊 ${target_amount:.1f}...")
@@ -379,9 +405,11 @@ def main():
     telegram_report_lines.append(f"*{_escape_markdown_v2('🔍 市場優質標的')}*")
     if better_ops:
         for op in better_ops:
-            diff = op['apy'] - portfolio_max_apy
-            # Simplified diff_str for cleaner report
-            diff_str = f"(🔥高出 {diff:.1f}%)" if diff > 0 else (f"(低於 {abs(diff):.1f}%)" if portfolio_max_apy != float('-inf') else "")
+            if portfolio_max_apy == float('-inf'):
+                diff_str = ""
+            else:
+                diff = op['apy'] - portfolio_max_apy
+                diff_str = f"(🔥高出 {diff:.1f}%)" if diff > 0 else f"(低於 {abs(diff):.1f}%)"
             
             telegram_report_lines.append(f"`{_escape_markdown_v2(op['symbol'])}`")
 

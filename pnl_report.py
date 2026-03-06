@@ -18,7 +18,7 @@ def calculate_pnl(trades_df):
     Considers spot buys, futures sells (opening short), futures buys (closing short), spot sells, and funding fees.
     """
     realized_pnl = 0
-    total_funding_fees = 0
+    funding_fees = 0
     processed_funding_ids = set()
     
     # Temporary storage for open spot positions to match with closing sells (FIFO)
@@ -105,7 +105,7 @@ def calculate_pnl(trades_df):
                     continue # 跳過重複的資金費記錄
                 processed_funding_ids.add(tran_id)
             
-            total_funding_fees += row['FundingFee']
+            funding_fees += row['FundingFee']
         
         # Rollback_Spot is essentially a Close_Spot for the purposes of PnL calculation
         elif row['EventType'] == 'Rollback_Spot':
@@ -114,11 +114,11 @@ def calculate_pnl(trades_df):
             if amount_to_sell > 0:
                 print(f"Warning: Attempted to sell more spot than open buy positions during rollback for {row['Symbol']}. Remaining to sell: {amount_to_sell}")
 
-
-    # Note: This PnL calculation assumes that for a hedged strategy, spot buy and futures short are matched.
-    # It tracks PnL from the closing of these positions.
+    # 檢查倉位是否仍然開放
+    is_open = len(open_spot_positions) > 0 or len(open_futures_short_positions) > 0
     
-    return realized_pnl, total_funding_fees
+    # 如果倉位是開放的，已實現損益應為 0，因為尚未平倉
+    return 0 if is_open else realized_pnl, funding_fees, is_open
 
 def send_telegram_report(message):
     telegram_user_id = config.TELEGRAM_USER_ID
@@ -158,21 +158,28 @@ def main():
 
     # Group by Symbol and calculate PnL for each
     for symbol, group in df.groupby('Symbol'):
-        realized_pnl_pair, funding_fees_pair = calculate_pnl(group)
+        # 過濾掉無關的符號
+        if symbol == 'USDT':
+            continue
+            
+        realized_pnl_pair, funding_fees_pair, is_open = calculate_pnl(group)
         pnl_by_pair[symbol] = {
             'realized_pnl': realized_pnl_pair,
             'funding_fees': funding_fees_pair,
-            'net_pnl': realized_pnl_pair + funding_fees_pair
+            'net_pnl': realized_pnl_pair + funding_fees_pair,
+            'is_open': is_open
         }
-        total_realized_pnl += realized_pnl_pair
-        total_funding_fees += funding_fees_pair
+        # 總損益只計算已平倉的
+        if not is_open:
+            total_realized_pnl += realized_pnl_pair
+            total_funding_fees += funding_fees_pair
 
     # 建立報表內容字串
     report_lines = []
     def p(text=""):
         print(text)
         report_lines.append(text)
-
+    
     # Generate Report
     p(f"*{_escape_markdown_v2('--- 🦅 資金費率 PnL 報表 ---')}*")
     p("")
@@ -181,8 +188,10 @@ def main():
         p(f"_{_escape_markdown_v2('未找到可分析的交易對。')}_")
     else:
         for symbol, pnl_data in pnl_by_pair.items():
-            p(f"🪙 *{_escape_markdown_v2('交易對')}*: `{symbol}`")
-            p(f"  📈 {_escape_markdown_v2('已實現損益')}: `{pnl_data['realized_pnl']:.4f}`")
+            status_str = " (持倉中)" if pnl_data['is_open'] else ""
+            pnl_label = "未實現損益" if pnl_data['is_open'] else "已實現損益"
+            p(f"🪙 *{_escape_markdown_v2(f'交易對: {symbol}{status_str}')}*")
+            p(f"  📈 {_escape_markdown_v2(pnl_label)}: `{pnl_data['realized_pnl']:.4f}`")
             p(f"  💰 {_escape_markdown_v2('資金費用')}: `{pnl_data['funding_fees']:.4f}`")
             net_pnl = pnl_data['net_pnl']
             p(f"  {_escape_markdown_v2('淨損益')}: *`{net_pnl:.4f}`*")

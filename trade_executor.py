@@ -146,11 +146,16 @@ def get_exchange_info():
     return spot_info, fut_info
 
 def check_spot_pair_exists(symbol, spot_exchange_info):
-    """檢查現貨交易對是否存在"""
+    """檢查現貨交易對是否存在且處於交易狀態"""
     base_asset = symbol.replace('USDT', '')
+    target_symbol = symbol
     if base_asset == 'XAU': # 特殊處理 PAXGUSDT
-        return any(s['symbol'] == 'PAXGUSDT' for s in spot_exchange_info['symbols'])
-    return any(s['symbol'] == symbol for s in spot_exchange_info['symbols'])
+        target_symbol = 'PAXGUSDT'
+    
+    for s in spot_exchange_info['symbols']:
+        if s['symbol'] == target_symbol:
+            return s.get('status') == 'TRADING'
+    return False
 
 def get_precision_from_step_size(step_size_str):
     step_size_str = step_size_str.rstrip('0') # 去除尾隨零，例如 "0.010000" -> "0.01"
@@ -292,6 +297,7 @@ def execute_hedge_safe(symbol, amount_usdt, api_key, secret_key, spot_info_raw, 
     spot_fee = calculate_spot_fee(spot_res.get('fills', []), actual_spot_price, spot_symbol)
     log_trade_event("Open_Spot", spot_symbol, side="buy", usdt_value=spot_cummulative_quote_qty, quantity=spot_executed_qty, price=actual_spot_price, fee=spot_fee, message=f"ID:{spot_res['orderId']}")
     print(f"   ✅ 現貨成交! (ID: {spot_res['orderId']})")
+    send_telegram_message(f"🟢 [開倉] 現貨買入成功: {spot_symbol}\n數量: {spot_executed_qty}\n均價: {actual_spot_price:.4f}\n總額: {spot_cummulative_quote_qty:.2f} USDT")
     
     # 2. 空合約
     print(f"   -> 做空合約...")
@@ -327,6 +333,7 @@ def execute_hedge_safe(symbol, amount_usdt, api_key, secret_key, spot_info_raw, 
         log_trade_event("Open_Futures", symbol, side="sell", usdt_value=fut_cum_quote, quantity=fut_executed_qty, price=actual_fut_price, fee=fut_fee, message=f"ID:{fut_res['orderId']}")
         print(f"   ✅ 合約空單成交! (ID: {fut_res['orderId']})")
         print(f"🎉 對沖策略部署成功！")
+        send_telegram_message(f"🔴 [開倉] 合約做空成功: {symbol}\n數量: {fut_executed_qty}\n均價: {actual_fut_price:.4f}\n名目價值: {fut_cum_quote:.2f} USDT")
         return True
     else:
         # 3. 回滾
@@ -399,6 +406,7 @@ def transfer_funds(amount, transfer_type, api_key, secret_key, min_transfer_amou
     if "tranId" in transfer_res:
         print(f"   ✅ 劃轉成功! Transaction ID: {transfer_res['tranId']}")
         log_trade_event("Fund_Transfer", "USDT", side="transfer", usdt_value=amount, message=f"Type:{transfer_type}, ID:{transfer_res['tranId']}") # Updated log_trade_event
+        send_telegram_message(f"🔄 [資金] 劃轉成功\n類型: {transfer_type}\n金額: {amount:.2f} USDT")
         return True
     else:
         error_msg = f"資金劃轉失敗! Error: {transfer_res.get('msg', transfer_res)}"
@@ -426,7 +434,11 @@ def check_and_balance_funds(api_key, secret_key, needed_spot, needed_fut, min_tr
 
     # 計算各帳戶資金缺口
     spot_deficit = max(0, needed_spot_buffered - current_spot_free)
+    if spot_deficit > 0:
+        spot_deficit = math.ceil(spot_deficit * 100) / 100
     fut_deficit = max(0, needed_fut_buffered - current_fut_free)
+    if fut_deficit > 0:
+        fut_deficit = math.ceil(fut_deficit * 100) / 100
 
     transfer_successful = True
     # 情況 1: 現貨不足，需要從合約劃轉
@@ -532,6 +544,7 @@ def close_position(symbol, amount, api_key, secret_key, spot_info_raw): # Added 
     fut_fee = get_futures_fee(symbol, fut_close_res['orderId'], api_key, secret_key)
     log_trade_event("Close_Futures", symbol, side="buy", usdt_value=fut_cum_quote, quantity=fut_executed_qty, price=actual_fut_price, fee=fut_fee, message=f"ID:{fut_close_res['orderId']}")
     print(f"   ✅ 合約已平倉 {fut_executed_qty}。")
+    send_telegram_message(f"🟢 [平倉] 合約平倉成功: {symbol}\n數量: {fut_executed_qty}\n均價: {actual_fut_price:.4f}\n名目價值: {fut_cum_quote:.2f} USDT")
 
     spot_symbol = symbol
     if symbol == 'XAUUSDT': spot_symbol = 'PAXGUSDT'
@@ -602,6 +615,7 @@ def close_position(symbol, amount, api_key, secret_key, spot_info_raw): # Added 
                     spot_fee_sell = calculate_spot_fee(spot_sell_res.get('fills', []), actual_spot_price_sell, spot_symbol)
                     log_trade_event("Close_Spot", spot_symbol, side="sell", usdt_value=spot_cummulative_quote_qty_sell, quantity=spot_executed_qty_sell, price=actual_spot_price_sell, fee=spot_fee_sell, message=f"ID:{spot_sell_res['orderId']}")
                     print("   ✅ 現貨已賣出。")
+                    send_telegram_message(f"🔴 [平倉] 現貨賣出成功: {spot_symbol}\n數量: {spot_executed_qty_sell}\n均價: {actual_spot_price_sell:.4f}\n回收金額: {spot_cummulative_quote_qty_sell:.2f} USDT")
                 else:
                     error_msg = f"現貨賣出失敗: {spot_sell_res.get('msg', spot_sell_res)}"
                     print(f"   ❌ {error_msg}")
