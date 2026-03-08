@@ -19,8 +19,8 @@ def _escape_markdown_v2(text: str) -> str:
     """Escapes text for Telegram's MarkdownV2 parse mode."""
     # In MarkdownV2, these characters must be escaped:
     # _ * [ ] ( ) ~ ` > # + - = | { } . !
-    escape_chars = r'_*~`>#+-=|{}.!'
-    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', str(text))
+    escape_chars = r'_*\[\]\(\)~`>#\+\-=|{}\.!'
+    return re.sub(f'([{escape_chars}])', r'\\\1', str(text))
 
 def log_trade_event(event_type, symbol, side="", usdt_value=0.0, quantity=0.0, price=0.0, fee=0.0, funding_fee=0.0, message=""):
     log_file = config.TRADE_LOG_FILE # Use config for log file path

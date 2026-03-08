@@ -8,8 +8,8 @@ def _escape_markdown_v2(text: str) -> str:
     """Escapes text for Telegram's MarkdownV2 parse mode."""
     # In MarkdownV2, these characters must be escaped:
     # _ * [ ] ( ) ~ ` > # + - = | { } . !
-    escape_chars = r'_*~`>#+-=|{}.!'
-    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', str(text))
+    escape_chars = r'_*\[\]\(\)~`>#\+\-=|{}\.!'
+    return re.sub(f'([{escape_chars}])', r'\\\1', str(text))
 
 
 def calculate_pnl(trades_df):
